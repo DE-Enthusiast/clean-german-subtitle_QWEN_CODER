@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clean German Subtitles</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --card-bg: #f8fafc;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --muted: #64748b;
+      --primary: #0284c7;
+      --primary-hover: #0369a1;
+      --success: #16a34a;
+      --danger: #dc2626;
+    }
+
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 16px;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      box-sizing: border-box;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    h1 {
+      font-size: 14px;
+      font-weight: 700;
+      margin: 0;
+      letter-spacing: -0.01em;
+    }
+
+    .badge {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--primary);
+    }
+
+    .toggle-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--card-bg);
+      padding: 10px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      margin-bottom: 14px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 38px;
+      height: 22px;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #cbd5e1;
+      transition: .2s;
+      border-radius: 22px;
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 16px;
+      width: 16px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: .2s;
+      border-radius: 50%;
+    }
+
+    input:checked + .slider {
+      background-color: var(--primary);
+    }
+
+    input:checked + .slider:before {
+      transform: translateX(16px);
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 6px;
+      color: var(--text);
+    }
+
+    input[type="password"], select {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 12px;
+      margin-bottom: 12px;
+      background: #ffffff;
+      color: var(--text);
+      outline: none;
+    }
+
+    input[type="password"]:focus, select:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 2px rgba(2, 132, 199, 0.15);
+    }
+
+    .actions-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    button {
+      padding: 8px 12px;
+      background-color: var(--primary);
+      color: #ffffff;
+      border: none;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    button:hover {
+      background-color: var(--primary-hover);
+    }
+
+    button.secondary {
+      background-color: #e2e8f0;
+      color: #334155;
+    }
+
+    button.secondary:hover {
+      background-color: #cbd5e1;
+    }
+
+    #msg {
+      margin-top: 8px;
+      font-size: 12px;
+      text-align: center;
+      min-height: 18px;
+      font-weight: 500;
+    }
+
+    .hint {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 10px;
+      line-height: 1.4;
+      border-top: 1px solid var(--border);
+      padding-top: 8px;
+    }
+
+    .hint a {
+      color: var(--primary);
+      text-decoration: none;
+    }
+    .hint a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Clean German Subtitles</h1>
+    <span class="badge">v4.4.0</span>
+  </div>
+
+  <div class="toggle-row">
+    <span>Enable Translation</span>
+    <label class="switch">
+      <input type="checkbox" id="extToggle" checked>
+      <span class="slider"></span>
+    </label>
+  </div>
+
+  <label for="apiKey">Gemini API Key</label>
+  <input type="password" id="apiKey" placeholder="AIzaSy...">
+
+  <label for="modelSelect">Translation Model</label>
+  <select id="modelSelect">
+    <option value="gemini-3.1-flash-lite" selected>Gemini 3.1 Flash-Lite (Fastest & Free Tier safe)</option>
+    <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+    <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
+  </select>
+
+  <label for="fontSizeSelect">Subtitle Size</label>
+  <select id="fontSizeSelect">
+    <option value="small">Small</option>
+    <option value="normal" selected>Normal (Recommended)</option>
+    <option value="large">Large</option>
+  </select>
+
+  <div class="actions-grid">
+    <button id="saveBtn">Save Settings</button>
+    <button id="testBtn" class="secondary">Test Key</button>
+  </div>
+
+  <button id="clearCacheBtn" class="secondary" style="width: 100%;">Clear Translation Cache</button>
+
+  <div id="msg"></div>
+
+  <div class="hint">
+    Free API key available at <a href="https://aistudio.google.com" target="_blank">aistudio.google.com</a>. Caches translated clauses locally to save quota on re-watches.
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,64 @@
+/* 1. Hide YouTube's native captions so they never overlap or flicker */
+.ytp-caption-window-container,
+.caption-window,
+.ytp-caption-segment {
+  display: none !important;
+  opacity: 0 !important;
+  visibility: hidden !important;
+}
+
+/* 2. Custom clean subtitle overlay */
+#clean-subs-container {
+  position: absolute;
+  bottom: 72px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 999999;
+  text-align: center;
+  pointer-events: none;
+  max-width: 86%;
+  width: auto;
+  transition: bottom 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+#clean-subs-text {
+  display: none;
+  background-color: rgba(10, 10, 10, 0.88);
+  color: #ffffff;
+  font-family: "YouTube Noto", Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  font-size: clamp(16px, 2.2vw, 24px);
+  font-weight: 500;
+  line-height: 1.42;
+  letter-spacing: 0.2px;
+  padding: 6px 14px;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.75);
+  text-shadow: 0 1px 2px #000000;
+  white-space: pre-wrap;
+  backdrop-filter: blur(2px);
+}
+
+/* User size preferences */
+#clean-subs-container.font-small #clean-subs-text {
+  font-size: clamp(13px, 1.7vw, 19px);
+  padding: 4px 10px;
+}
+
+#clean-subs-container.font-large #clean-subs-text {
+  font-size: clamp(19px, 2.8vw, 30px);
+  padding: 8px 18px;
+}
+
+/* Adjust vertical position when player controls auto-hide */
+.ytp-autohide #clean-subs-container {
+  bottom: 46px;
+}
+
+/* Fullscreen adjustments */
+.ytp-fullscreen #clean-subs-container {
+  bottom: 84px;
+}
+
+.ytp-fullscreen.ytp-autohide #clean-subs-container {
+  bottom: 50px;
+}
