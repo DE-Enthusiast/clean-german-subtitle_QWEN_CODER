@@ -1,6 +1,6 @@
 const BATCH_SIZE = 20;
 const MAX_BATCH_CHARS = 4500;
-const DEFAULT_MODEL = "gemini-2.5-flash-lite";
+const DEFAULT_MODEL = "gemini-flash-latest";
 // Transient server-side failures worth retrying with backoff. 503 in
 // particular is returned by Gemini when a model is overloaded or being
 // deprecated — it does NOT mean the API key is invalid.
@@ -217,8 +217,10 @@ function describeError(error) {
   const status = error?.status || parseStatus(error?.message);
   const lower = String(error?.message || "").toLowerCase();
 
-  if (status === 400 && /not found|unsupported|model/i.test(lower)) {
-    return "The selected model isn't available on your account. Pick a different model in the extension popup.";
+  // Surface the real reason instead of a generic message whenever the API
+  // (or our retry logic) already produced one that mentions the model/key.
+  if (isModelNotFound400(lower) || status === 404 || /no fallback model worked/i.test(lower)) {
+    return "The selected model isn't available on your account and no fallback worked. Open the extension popup and pick a different model (the first option is always supported).";
   }
   if (status === 400 && /api key not valid|invalid api key|api_key_invalid/i.test(lower)) {
     return "Your Gemini API key was rejected. Double-check it in the extension popup.";
@@ -235,7 +237,20 @@ function describeError(error) {
   if (/timed out/i.test(lower)) {
     return "Gemini request timed out after retries. Check your connection and try again.";
   }
-  return "Translation failed after retries. See the browser console for details.";
+  return `Translation failed after retries: ${String(error?.message || "unknown error").slice(0, 300)}`;
+}
+
+// Google sometimes reports retired/unknown models as 404 NOT_FOUND and
+// sometimes as 400 INVALID_ARGUMENT with "not found" wording. Normalize both
+// so the auto-fallback kicks in for either shape.
+function isModelNotFound400(messageText) {
+  const lower = String(messageText || "").toLowerCase();
+  if (!lower.includes("gemini api error (400)")) return false;
+  return /(?:model|not found|unsupported)/i.test(lower) &&
+    (/is not found/i.test(lower) || /no longer available/i.test(lower) ||
+     /not supported for generatecontent/i.test(lower) ||
+     /unsupported model type/i.test(lower) ||
+     /invalid argument/i.test(lower));
 }
 
 async function processRequest({ requestId, videoId, texts, startIndex = 0, newTexts, tabId, currentPlaybackSec }) {
@@ -553,27 +568,79 @@ async function translateBatchResilient(batch, apiKey, modelName, shouldAbort) {
 // If the user's selected model is retired/unavailable on their account
 // (404 NOT_FOUND), Google suggests a replacement in the error message.
 // Rather than failing the whole job, we auto-switch to a working model:
-// first the one Google recommends, then any other known-good default.
+// first the one Google recommends, then live ListModels results, then any
+// other known-good names as a last resort.
 const FALLBACK_MODELS = [
+  "gemini-flash-latest",
   "gemini-2.5-flash-lite",
   "gemini-2.5-flash",
-  "gemini-2.0-flash",
-  "gemini-2.5-pro"
+  "gemini-2.0-flash"
 ];
 
 let activeModelOverride = null;
 
-function suggestedModelFromError(text) {
-  const match = String(text || "").match(/models\/([a-z0-9._-]+)/i);
-  return match ? match[1] : "";
+// Cache of models actually available to THIS key (ListModels is per-account).
+// Refreshed when it goes stale so retired-but-listed models self-heal.
+let availableModelsCache = { list: [], fetchedAt: 0 };
+const AVAILABLE_MODELS_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+async function fetchAvailableModels(apiKey) {
+  const now = Date.now();
+  if (
+    availableModelsCache.list.length &&
+    now - availableModelsCache.fetchedAt < AVAILABLE_MODELS_TTL_MS
+  ) {
+    return availableModelsCache.list;
+  }
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${encodeURIComponent(apiKey)}`
+    );
+    if (!response.ok) return availableModelsCache.list;
+
+    const data = await response.json();
+    const list = (Array.isArray(data?.models) ? data.models : [])
+      .filter((m) => Array.isArray(m?.supportedGenerationMethods) &&
+        m.supportedGenerationMethods.includes("generateContent"))
+      .map((m) => String(m?.name || "").replace(/^models\//, ""))
+      .filter(Boolean);
+
+    if (list.length) {
+      availableModelsCache = { list, fetchedAt: now };
+    }
+    return list;
+  } catch (_) {
+    return availableModelsCache.list;
+  }
 }
 
-function buildModelCandidates(requestedModel, errorText) {
+function suggestedModelFromError(text) {
+  // Prefer an explicit recommendation ("... to use models/gemini-3.6-flash ...")
+  const rec = String(text || "").match(/use\s+models\/([a-z0-9._-]+)/i);
+  if (rec) return rec[1];
+  // Otherwise the first "models/<name>" mention that isn't the failed model.
+  const all = [...String(text || "").matchAll(/models\/([a-z0-9._-]+)/gi)].map((m) => m[1]);
+  return all[all.length - 1] || "";
+}
+
+async function buildModelCandidates(requestedModel, errorText, apiKey) {
   const suggested = suggestedModelFromError(errorText);
+  const live = await fetchAvailableModels(apiKey);
   const seen = new Set();
   const candidates = [];
 
-  for (const model of [suggested, requestedModel, ...FALLBACK_MODELS]) {
+  // Order: Google's suggestion > newer variants of the requested family
+  // (e.g. gemini-2.5-pro -> gemini-2.5-pro-* from ListModels) > live list
+  // (prefer -lite/flash: cheap + free-tier friendly) > static fallbacks.
+  const familyPrefix = requestedModel ? requestedModel.split("@")[0] : "";
+  const familyVariants = live.filter((m) => m.startsWith(familyPrefix) && m !== requestedModel);
+  const cheaperFirst = [...live].sort((a, b) => {
+    const score = (n) => (/pro/i.test(n) ? 2 : /flash/i.test(n) ? 1 : 0);
+    return score(a) - score(b);
+  });
+
+  for (const model of [suggested, requestedModel, ...familyVariants, ...cheaperFirst, ...FALLBACK_MODELS]) {
     if (model && !seen.has(model)) {
       seen.add(model);
       candidates.push(model);
@@ -606,14 +673,16 @@ async function translateWithRetry(batch, apiKey, modelName, shouldAbort) {
       // Model not found / not available: swap models and retry immediately
       // (no backoff — this is deterministic, not load-related). Google's 404
       // body usually names a replacement model; otherwise try known-good ones.
-      if (status === 404) {
-        const candidates = buildModelCandidates(effectiveModel, error?.message);
+      if (status === 404 || isModelNotFound400(error?.message)) {
+        // Google returns retired models as either 404 NOT_FOUND or, for some
+        // endpoints/accounts, a 400 INVALID_ARGUMENT "model is not found".
+        const candidates = await buildModelCandidates(effectiveModel, error?.message, apiKey);
         let recovered = false;
 
         for (const candidate of candidates) {
           if (candidate === effectiveModel || triedModels.has(candidate)) continue;
           console.warn(
-            `[CleanSubs] Model "${effectiveModel}" is unavailable (404). Falling back to "${candidate}".`
+            `[CleanSubs] Model "${effectiveModel}" is unavailable (${status}). Falling back to "${candidate}".`
           );
           effectiveModel = candidate;
           activeModelOverride = candidate;
