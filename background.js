@@ -1,6 +1,10 @@
 const BATCH_SIZE = 20;
 const MAX_BATCH_CHARS = 4500;
-const DEFAULT_MODEL = "gemini-3.1-flash-lite";
+const DEFAULT_MODEL = "gemini-2.5-flash-lite";
+// Transient server-side failures worth retrying with backoff. 503 in
+// particular is returned by Gemini when a model is overloaded or being
+// deprecated — it does NOT mean the API key is invalid.
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MODEL_PATTERN = /^[a-zA-Z0-9._\-]{1,80}$/;
 const CACHE_PREFIX = "cleanSubsCache:";
 const CACHE_META_KEY = "cleanSubsCacheMeta";
@@ -131,7 +135,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       if (!isStaleJob(tabId, requestId)) {
         await sendProgress(tabId, requestId, {
           type: "TRANSLATION_ERROR",
-          error: error?.message || String(error)
+          error: describeError(error),
+          details: error?.message || String(error)
         });
       }
     })
@@ -152,6 +157,36 @@ function isStaleJob(tabId, requestId) {
     return true;
   }
   return false;
+}
+
+// Turn a raw Gemini error into a short, actionable user-facing message.
+// Previously the full API error body (including huge JSON blobs) leaked into
+// logs/UI and every failure looked like "Gemini API Error (503)", which users
+// misread as an invalid key — 503 actually means Google's servers/model are
+// temporarily unavailable.
+function describeError(error) {
+  const status = error?.status || parseStatus(error?.message);
+  const lower = String(error?.message || "").toLowerCase();
+
+  if (status === 400 && /not found|unsupported|model/i.test(lower)) {
+    return "The selected model isn't available on your account. Pick a different model in the extension popup.";
+  }
+  if (status === 400 && /api key not valid|invalid api key|api_key_invalid/i.test(lower)) {
+    return "Your Gemini API key was rejected. Double-check it in the extension popup.";
+  }
+  if (status === 403) {
+    return "Access denied by Gemini. Make sure Generative Language API is enabled for this key.";
+  }
+  if (status === 429) {
+    return "Gemini rate limit or free-tier quota reached after retries. Try again in a few minutes.";
+  }
+  if (status >= 500) {
+    return `Gemini service temporarily unavailable (HTTP ${status}). Your key is fine — please retry.`;
+  }
+  if (/timed out/i.test(lower)) {
+    return "Gemini request timed out after retries. Check your connection and try again.";
+  }
+  return "Translation failed after retries. See the browser console for details.";
 }
 
 async function processRequest({ requestId, videoId, texts, startIndex = 0, newTexts, tabId, currentPlaybackSec }) {
@@ -482,11 +517,15 @@ async function translateWithRetry(batch, apiKey, modelName, shouldAbort) {
       const status = error?.status || parseStatus(error?.message);
       const retryableShape = Boolean(error?.retryableShape);
 
-      if (status !== 429 && !retryableShape) throw error;
+      if (!RETRYABLE_STATUSES.has(status) && !retryableShape) throw error;
 
-      const waitMs = retryableShape
+      // Respect RetryInfo for 429s, but also back off transient 5xx errors
+      // (500/502/503/504) — previously these were thrown immediately and the
+      // whole job failed with a raw "Gemini API Error (503)" even though the
+      // condition is usually gone after a few seconds.
+      const waitMs = retryableShape && !RETRYABLE_STATUSES.has(status)
         ? 1200 * (attempt + 1)
-        : Math.min(60000, Math.max(5000, error?.retryAfterMs || 30000));
+        : Math.min(60000, Math.max(2000, error?.retryAfterMs || 5000 * Math.pow(2, attempt)));
 
       console.warn(
         `[CleanSubs] Gemini retry in ${Math.round(waitMs / 1000)}s (attempt ${attempt + 1}/${MAX_RETRIES}).`

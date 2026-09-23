@@ -210,9 +210,14 @@
 
   <label for="modelSelect">Translation Model</label>
   <select id="modelSelect">
-    <option value="gemini-3.1-flash-lite" selected>Gemini 3.1 Flash-Lite (Fastest & Free Tier safe)</option>
+    <!-- NOTE: keep these values in sync with KNOWN_MODELS in popup.js and
+         DEFAULT_MODEL in background.js. gemini-1.5-flash is deprecated on the
+         Gemini API and many keys get 404/503 for it; a model that returns an
+         error here would previously be shown as "Invalid key or quota". -->
+    <option value="gemini-2.5-flash-lite" selected>Gemini 2.5 Flash-Lite (Fastest &amp; free-tier friendly)</option>
     <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-    <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
+    <option value="gemini-2.5-pro">Gemini 2.5 Pro (best quality, slower)</option>
+    <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
   </select>
 
   <label for="fontSizeSelect">Subtitle Size</label>

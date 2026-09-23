@@ -20,6 +20,16 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   if (data.selectedModel) {
+    // Users may have saved a model that has since been deprecated/renamed
+    // (e.g. the old "gemini-3.1-flash-lite" option). If it isn't in the
+    // current list, add it as a "(legacy)" entry instead of silently
+    // discarding their choice — they can switch to a supported model.
+    if (![...modelSelect.options].some((o) => o.value === data.selectedModel)) {
+      const opt = document.createElement("option");
+      opt.value = data.selectedModel;
+      opt.textContent = `${data.selectedModel} (legacy — may be unavailable)`;
+      modelSelect.appendChild(opt);
+    }
     modelSelect.value = data.selectedModel;
   }
 
@@ -100,12 +110,38 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (res.ok) {
         showMessage("Connection verified! Model active.", "#16a34a");
       } else {
-        const errorText = await res.text();
-        showMessage(`Error (${res.status}): Invalid key or quota.`, "#dc2626");
-        console.error("Test failed:", errorText);
+        // The old code claimed "Invalid key or quota" for EVERY failure,
+        // which was misleading — a 503 usually means Google's servers are
+        // overloaded or the selected model is unavailable, not that the key
+        // is bad. Surface the real API error message instead.
+        const errorText = await res.text().catch(() => "");
+        let detail = "";
+        try {
+          const parsed = JSON.parse(errorText);
+          detail = String(parsed?.error?.message || "").trim();
+        } catch (_) {}
+        if (!detail) {
+          detail = errorText.replace(/\s+/g, " ").trim().slice(0, 200);
+        }
+
+        let hint;
+        if (res.status === 400 && /not found|unsupported/i.test(detail)) {
+          hint = "The selected model doesn't exist. Pick another one.";
+        } else if (res.status === 403) {
+          hint = "Key rejected — check it is enabled for Generative Language API.";
+        } else if (res.status === 429) {
+          hint = "Rate limit / free-tier quota reached. Wait and retry.";
+        } else if (res.status >= 500) {
+          hint = "Google server issue — your key is fine. Try again shortly.";
+        } else {
+          hint = "Request failed.";
+        }
+
+        showMessage(`Error (${res.status}): ${hint}`, "#dc2626", 8000);
+        console.error("Test failed:", detail || errorText);
       }
     } catch (err) {
-      showMessage("Network test failed.", "#dc2626");
+      showMessage("Network test failed: " + (err?.message || err), "#dc2626", 8000);
     }
   });
 
