@@ -125,9 +125,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
 
         let hint;
-        if (res.status === 400 && /not found|unsupported/i.test(detail)) {
-          hint = "The selected model doesn't exist. Pick another one.";
-        } else if (res.status === 403) {
+        if (res.status === 404 || /no longer available|not found|unsupported/i.test(detail)) {
+          hint = "This model is unavailable for your account — pick another one in the dropdown.";
+        } else if (res.status === 403 || /api key not valid|invalid api key|permission denied/i.test(detail)) {
           hint = "Key rejected — check it is enabled for Generative Language API.";
         } else if (res.status === 429) {
           hint = "Rate limit / free-tier quota reached. Wait and retry.";
@@ -137,8 +137,13 @@ document.addEventListener("DOMContentLoaded", async () => {
           hint = "Request failed.";
         }
 
-        showMessage(`Error (${res.status}): ${hint}`, "#dc2626", 8000);
-        console.error("Test failed:", detail || errorText);
+        // Show the real API message too — generic hints alone caused confusion
+        // (e.g. a 503 "high demand" error looking like a bad key).
+        showMessage(
+          `Error (${res.status}): ${hint}${detail ? ` — ${detail.slice(0, 160)}` : ""}`,
+          "#dc2626",
+          10000
+        );
       }
     } catch (err) {
       showMessage("Network test failed: " + (err?.message || err), "#dc2626", 8000);

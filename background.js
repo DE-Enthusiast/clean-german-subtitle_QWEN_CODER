@@ -501,21 +501,87 @@ async function translateBatchResilient(batch, apiKey, modelName, shouldAbort) {
   }
 }
 
+// If the user's selected model is retired/unavailable on their account
+// (404 NOT_FOUND), Google suggests a replacement in the error message.
+// Rather than failing the whole job, we auto-switch to a working model:
+// first the one Google recommends, then any other known-good default.
+const FALLBACK_MODELS = [
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-2.5-pro"
+];
+
+let activeModelOverride = null;
+
+function suggestedModelFromError(text) {
+  const match = String(text || "").match(/models\/([a-z0-9._-]+)/i);
+  return match ? match[1] : "";
+}
+
+function buildModelCandidates(requestedModel, errorText) {
+  const suggested = suggestedModelFromError(errorText);
+  const seen = new Set();
+  const candidates = [];
+
+  for (const model of [suggested, requestedModel, ...FALLBACK_MODELS]) {
+    if (model && !seen.has(model)) {
+      seen.add(model);
+      candidates.push(model);
+    }
+  }
+  return candidates;
+}
+
 async function translateWithRetry(batch, apiKey, modelName, shouldAbort) {
   let lastError = null;
+  // Honor an auto-switched model across batches so we don't re-discover the
+  // same 404 on every chunk of the job.
+  let effectiveModel = activeModelOverride || modelName;
+  const triedModels = new Set([effectiveModel]);
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     if (shouldAbort?.()) throw new Error("Translation canceled.");
 
     try {
       await waitForRateSlot();
-      return await translateWithGemini(batch, apiKey, modelName);
+      const result = await translateWithGemini(batch, apiKey, effectiveModel);
+      return result;
     } catch (error) {
       lastError = error;
       if (shouldAbort?.()) throw error;
 
       const status = error?.status || parseStatus(error?.message);
       const retryableShape = Boolean(error?.retryableShape);
+
+      // Model not found / not available: swap models and retry immediately
+      // (no backoff — this is deterministic, not load-related). Google's 404
+      // body usually names a replacement model; otherwise try known-good ones.
+      if (status === 404) {
+        const candidates = buildModelCandidates(effectiveModel, error?.message);
+        let recovered = false;
+
+        for (const candidate of candidates) {
+          if (candidate === effectiveModel || triedModels.has(candidate)) continue;
+          console.warn(
+            `[CleanSubs] Model "${effectiveModel}" is unavailable (404). Falling back to "${candidate}".`
+          );
+          effectiveModel = candidate;
+          activeModelOverride = candidate;
+          triedModels.add(candidate);
+          recovered = true;
+          break;
+        }
+
+        if (recovered) {
+          attempt--; // model switch shouldn't consume a retry slot
+          continue;
+        }
+
+        throw new Error(
+          `Model "${effectiveModel}" was not found and no fallback model worked. Open the extension popup and pick a different model.`
+        );
+      }
 
       if (!RETRYABLE_STATUSES.has(status) && !retryableShape) throw error;
 
