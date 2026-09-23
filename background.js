@@ -1,26 +1,32 @@
 const BATCH_SIZE = 20;
 const MAX_BATCH_CHARS = 4500;
 const DEFAULT_MODEL = "gemini-3.1-flash-lite";
+const MODEL_PATTERN = /^[a-zA-Z0-9._\-]{1,80}$/;
 const CACHE_PREFIX = "cleanSubsCache:";
-const RATE_STATE_KEY = "cleanSubsRateState";
+const CACHE_META_KEY = "cleanSubsCacheMeta";
+const MAX_CACHE_ENTRIES = 20000;
 const MAX_REQUESTS_PER_MINUTE = 8;
 const MIN_REQUEST_GAP_MS = Math.ceil(60000 / MAX_REQUESTS_PER_MINUTE);
 const MAX_RETRIES = 3;
 const REQUEST_TIMEOUT_MS = 45000;
 const MIN_RECOVERY_BATCH = 4;
 const PROGRESS_CHUNK = 80;
+const HEARTBEAT_INTERVAL_MS = 20000;
 
 let translationQueue = Promise.resolve();
 const jobs = new Map();
 const latestRequestIdByTab = new Map();
-const keepAlivePorts = new Set();
+const keepAlivePorts = new Map();
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "clean-subs-keepalive") {
-    keepAlivePorts.add(port);
+    const tabId = port.sender?.tab?.id;
+    keepAlivePorts.set(port, { tabId, lastPingAt: Date.now() });
 
     port.onMessage.addListener((msg) => {
       if (msg?.type === "PING") {
+        const entry = keepAlivePorts.get(port);
+        if (entry) entry.lastPingAt = Date.now();
         try {
           port.postMessage({ type: "PONG" });
         } catch (_) {}
@@ -33,12 +39,54 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 });
 
+// Safety net: periodically wake the worker while any content script still has
+// an active keepalive port. Without this, a service-worker restart can leave a
+// long-running translation job stranded until the content script notices.
+setInterval(() => {
+  const now = Date.now();
+  for (const [port, entry] of keepAlivePorts) {
+    if (now - entry.lastPingAt > HEARTBEAT_INTERVAL_MS * 3) {
+      keepAlivePorts.delete(port);
+      continue;
+    }
+    try {
+      port.postMessage({ type: "WORKER_PING" });
+    } catch (_) {
+      keepAlivePorts.delete(port);
+    }
+  }
+}, HEARTBEAT_INTERVAL_MS);
+
+// Release per-tab bookkeeping when a tab goes away so jobs/maps can't leak.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  for (const [id, job] of jobs) {
+    if (job.tabId === tabId) jobs.delete(id);
+  }
+  latestRequestIdByTab.delete(tabId);
+});
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request?.action === "CHECK_JOB_ALIVE") {
+    const requestId = String(request.requestId || "");
+    const job = jobs.get(requestId);
+    const tabId = sender?.tab?.id;
+    const alive = !!job && !job.canceled && Number.isInteger(tabId)
+      ? latestRequestIdByTab.get(tabId) === requestId
+      : false;
+    try {
+      sendResponse({ type: "JOB_ALIVE_RESULT", requestId, alive });
+    } catch (_) {}
+    return false;
+  }
+
   if (request?.action !== "TRANSLATE_BATCH") return;
 
   const requestId = String(request.requestId || "");
   const videoId = String(request.videoId || "");
   const currentPlaybackSec = Number(request.currentPlaybackSec || 0);
+  const startIndex = Number.isInteger(request.startIndex) && request.startIndex > 0
+    ? request.startIndex
+    : 0;
   const texts = Array.isArray(request.texts)
     ? request.texts.map((x) => String(x || "").trim())
     : [];
@@ -67,7 +115,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   translationQueue = translationQueue
     .catch(() => {})
-    .then(() => processRequest({ requestId, videoId, texts, tabId, currentPlaybackSec }))
+    .then(() =>
+      processRequest({
+        requestId,
+        videoId,
+        texts,
+        startIndex,
+        newTexts: texts.slice(startIndex),
+        tabId,
+        currentPlaybackSec
+      })
+    )
     .catch(async (error) => {
       console.error("[CleanSubs] Translation job exception:", error);
       if (!isStaleJob(tabId, requestId)) {
@@ -96,7 +154,7 @@ function isStaleJob(tabId, requestId) {
   return false;
 }
 
-async function processRequest({ requestId, videoId, texts, tabId, currentPlaybackSec }) {
+async function processRequest({ requestId, videoId, texts, startIndex = 0, newTexts, tabId, currentPlaybackSec }) {
   if (isStaleJob(tabId, requestId)) return;
 
   const { geminiApiKey, extensionEnabled, selectedModel } = await chrome.storage.local.get([
@@ -122,10 +180,24 @@ async function processRequest({ requestId, videoId, texts, tabId, currentPlaybac
     return;
   }
 
-  const modelName = String(selectedModel || DEFAULT_MODEL).trim();
-  const total = texts.length;
-  const allTranslations = new Array(total);
-  const cacheKeys = texts.map((t) => makeCacheKey(t, modelName));
+  // Only ever pass a conservative model-name allowlist into the API URL.
+  let modelName = String(selectedModel || DEFAULT_MODEL).trim();
+  if (!MODEL_PATTERN.test(modelName)) {
+    console.warn(`[CleanSubs] Ignoring invalid model name "${modelName}"; using default.`);
+    modelName = DEFAULT_MODEL;
+  }
+
+  // For continuation requests the content script sends only the newly added
+  // cues; translateBatch works on this local slice and remaps indexes back
+  // into the full transcript when reporting progress. This avoids re-sending
+  // (and re-hashing / re-cache-looking-up) the entire transcript on every
+  // chunk of a 3h+ video, which was O(n²) overall.
+  const batchTexts = Array.isArray(newTexts) && newTexts.length > 0 ? newTexts : texts;
+  const total = Number.isInteger(startIndex) && startIndex >= 0
+    ? startIndex + batchTexts.length
+    : texts.length;
+  const allTranslations = new Array(batchTexts.length);
+  const cacheKeys = batchTexts.map((t) => makeCacheKey(t, modelName));
   const lookupKeys = cacheKeys.map((key) => CACHE_PREFIX + key);
 
   let cached = {};
@@ -139,7 +211,7 @@ async function processRequest({ requestId, videoId, texts, tabId, currentPlaybac
   const cachedTranslations = [];
   const uncachedIndexes = [];
 
-  for (let i = 0; i < total; i++) {
+  for (let i = 0; i < batchTexts.length; i++) {
     const value = cached[CACHE_PREFIX + cacheKeys[i]];
     if (typeof value === "string" && value.trim()) {
       allTranslations[i] = value;
@@ -151,14 +223,14 @@ async function processRequest({ requestId, videoId, texts, tabId, currentPlaybac
   }
 
   console.log(
-    `[CleanSubs] Video ${videoId}: ${cachedIndexes.length} cached cues, ${uncachedIndexes.length} to translate (${total} total).`
+    `[CleanSubs] Video ${videoId}: ${cachedIndexes.length} cached cues, ${uncachedIndexes.length} to translate (${batchTexts.length} in this request, ${total} total cues).`
   );
 
   let sentCached = 0;
   for (let i = 0; i < cachedIndexes.length; i += PROGRESS_CHUNK) {
     if (isStaleJob(tabId, requestId)) return;
 
-    const indexes = cachedIndexes.slice(i, i + PROGRESS_CHUNK);
+    const indexes = cachedIndexes.slice(i, i + PROGRESS_CHUNK).map((idx) => idx + startIndex);
     const translations = cachedTranslations.slice(i, i + PROGRESS_CHUNK);
     sentCached += indexes.length;
 
@@ -183,14 +255,19 @@ async function processRequest({ requestId, videoId, texts, tabId, currentPlaybac
       complete: true,
       completedCues: completed
     });
+    await pruneCacheIfNeeded().catch(() => {});
     return;
   }
 
-  const approxCurrentIndex = Math.max(0, Math.floor(currentPlaybackSec / 3));
+  // Translate from the playback position forward (approximate index heuristic),
+  // then wrap around to any earlier missed cues. Previously it sorted by raw
+  // absolute distance, which interleaved far-future batches with already-passed
+  // cues and wasted rate-limit budget on text the viewer may never reach soon.
+  const approxCurrentIndex = Math.max(0, Math.floor(currentPlaybackSec / 3) - startIndex);
   uncachedIndexes.sort((a, b) => {
-    const distA = Math.abs(a - approxCurrentIndex);
-    const distB = Math.abs(b - approxCurrentIndex);
-    return distA - distB;
+    const fwdA = a >= approxCurrentIndex ? a - approxCurrentIndex : Number.MAX_SAFE_INTEGER - (approxCurrentIndex - a);
+    const fwdB = b >= approxCurrentIndex ? b - approxCurrentIndex : Number.MAX_SAFE_INTEGER - (approxCurrentIndex - b);
+    return fwdA - fwdB;
   });
 
   let cursor = 0;
@@ -203,7 +280,7 @@ async function processRequest({ requestId, videoId, texts, tabId, currentPlaybac
 
     while (cursor < uncachedIndexes.length && batchIndexes.length < BATCH_SIZE) {
       const idx = uncachedIndexes[cursor];
-      const candidate = texts[idx];
+      const candidate = batchTexts[idx];
       const candidateChars = candidate.length + 8;
 
       if (batchIndexes.length > 0 && chars + candidateChars > MAX_BATCH_CHARS) {
@@ -215,7 +292,7 @@ async function processRequest({ requestId, videoId, texts, tabId, currentPlaybac
       cursor += 1;
     }
 
-    const batch = batchIndexes.map((idx) => texts[idx]);
+    const batch = batchIndexes.map((idx) => batchTexts[idx]);
 
     const batchTranslations = await translateBatchResilient(
       batch,
@@ -230,14 +307,21 @@ async function processRequest({ requestId, videoId, texts, tabId, currentPlaybac
     for (let i = 0; i < batchTranslations.length; i++) {
       const globalIndex = batchIndexes[i];
       const translated = String(batchTranslations[i] ?? "").trim();
-      allTranslations[globalIndex] = translated || texts[globalIndex];
+      allTranslations[globalIndex] = translated || batchTexts[globalIndex];
       cacheWrite[CACHE_PREFIX + cacheKeys[globalIndex]] = allTranslations[globalIndex];
     }
 
     try {
       await chrome.storage.local.set(cacheWrite);
+      await recordCacheWrite(Object.keys(cacheWrite));
     } catch (quotaErr) {
       console.warn("[CleanSubs] Cache storage write warning, continuing:", quotaErr);
+      // Storage is likely full — drop the oldest half of the cache and retry once.
+      await forcePruneCache().catch(() => {});
+      try {
+        await chrome.storage.local.set(cacheWrite);
+        await recordCacheWrite(Object.keys(cacheWrite));
+      } catch (_) {}
     }
 
     completed += batchIndexes.length;
@@ -245,7 +329,7 @@ async function processRequest({ requestId, videoId, texts, tabId, currentPlaybac
     await sendProgress(tabId, requestId, {
       type: "TRANSLATION_PROGRESS",
       total,
-      indexes: batchIndexes,
+      indexes: batchIndexes.map((idx) => idx + startIndex),
       translations: batchTranslations,
       complete: cursor >= uncachedIndexes.length,
       completedCues: completed
@@ -260,6 +344,8 @@ async function processRequest({ requestId, videoId, texts, tabId, currentPlaybac
     complete: true,
     completedCues: completed
   });
+
+  await pruneCacheIfNeeded().catch(() => {});
 }
 
 async function sendProgress(tabId, requestId, message) {
@@ -276,38 +362,81 @@ async function sendProgress(tabId, requestId, message) {
   }
 }
 
+// In-memory sliding-window rate limiter. The previous implementation stored
+// timestamps in chrome.storage.local and re-read them between awaits, which
+// (a) caused read-modify-write races that could let bursts exceed the limit
+// and (b) hammered storage on every single API call. All translation jobs are
+// already serialized through translationQueue, so a module-level array is
+// sufficient and correct.
+let recentRequestTimestamps = [];
+
 async function waitForRateSlot() {
-  const state = await chrome.storage.local.get(RATE_STATE_KEY);
-  let timestamps = Array.isArray(state[RATE_STATE_KEY]) ? state[RATE_STATE_KEY] : [];
+  for (;;) {
+    const now = Date.now();
+    recentRequestTimestamps = recentRequestTimestamps.filter(
+      (time) => Number.isFinite(time) && now - time < 60000
+    );
 
-  const now = Date.now();
-  timestamps = timestamps.filter((time) => Number.isFinite(time) && now - time < 60000);
+    let waitMs = 0;
 
-  const last = timestamps[timestamps.length - 1] || 0;
-  const gap = MIN_REQUEST_GAP_MS - (now - last);
+    if (recentRequestTimestamps.length >= MAX_REQUESTS_PER_MINUTE) {
+      waitMs = Math.max(250, 60000 - (now - recentRequestTimestamps[0]) + 100);
+    } else {
+      const last = recentRequestTimestamps[recentRequestTimestamps.length - 1] || 0;
+      const gap = MIN_REQUEST_GAP_MS - (now - last);
+      if (gap > 0) waitMs = gap;
+    }
 
-  if (gap > 0) await sleep(gap);
-
-  timestamps = (await chrome.storage.local.get(RATE_STATE_KEY))[RATE_STATE_KEY];
-  timestamps = Array.isArray(timestamps)
-    ? timestamps.filter((time) => Number.isFinite(time) && Date.now() - time < 60000)
-    : [];
-
-  while (timestamps.length >= MAX_REQUESTS_PER_MINUTE) {
-    const waitMs = Math.max(500, 60000 - (Date.now() - timestamps[0]) + 250);
+    if (waitMs <= 0) break;
     await sleep(waitMs);
-
-    timestamps = (await chrome.storage.local.get(RATE_STATE_KEY))[RATE_STATE_KEY];
-    timestamps = Array.isArray(timestamps)
-      ? timestamps.filter((time) => Number.isFinite(time) && Date.now() - time < 60000)
-      : [];
   }
 
-  timestamps.push(Date.now());
+  recentRequestTimestamps.push(Date.now());
+}
 
-  await chrome.storage.local.set({
-    [RATE_STATE_KEY]: timestamps.slice(-MAX_REQUESTS_PER_MINUTE)
-  });
+// Keep the translation cache bounded: track insertion order in a small meta
+// entry and evict oldest entries once the cache grows past MAX_CACHE_ENTRIES.
+async function pruneCacheIfNeeded() {
+  const meta = await chrome.storage.local.get(CACHE_META_KEY);
+  const order = Array.isArray(meta[CACHE_META_KEY]?.order) ? meta[CACHE_META_KEY].order : [];
+
+  if (order.length <= MAX_CACHE_ENTRIES) return;
+
+  const evictCount = Math.floor(MAX_CACHE_ENTRIES / 4);
+  const toEvict = order.slice(0, evictCount);
+  const remaining = order.slice(evictCount);
+
+  await chrome.storage.local.remove(toEvict);
+  await chrome.storage.local.set({ [CACHE_META_KEY]: { order: remaining } });
+  console.log(`[CleanSubs] Pruned ${toEvict.length} oldest cache entries (${remaining.length} remain).`);
+}
+
+async function forcePruneCache() {
+  const meta = await chrome.storage.local.get(CACHE_META_KEY);
+  const order = Array.isArray(meta[CACHE_META_KEY]?.order) ? meta[CACHE_META_KEY].order : [];
+  if (order.length === 0) return;
+
+  const half = Math.ceil(order.length / 2);
+  const toEvict = order.slice(0, half);
+
+  await chrome.storage.local.remove(toEvict);
+  await chrome.storage.local.set({ [CACHE_META_KEY]: { order: order.slice(half) } });
+}
+
+async function recordCacheWrite(keys) {
+  try {
+    const meta = await chrome.storage.local.get(CACHE_META_KEY);
+    const order = Array.isArray(meta[CACHE_META_KEY]?.order) ? meta[CACHE_META_KEY].order : [];
+    const existing = new Set(order);
+    for (const key of keys) {
+      if (!existing.has(key)) order.push(key);
+    }
+    // Trim from the front if we massively overshot the soft cap.
+    const trimmed = order.length > MAX_CACHE_ENTRIES * 1.5
+      ? order.slice(order.length - MAX_CACHE_ENTRIES)
+      : order;
+    await chrome.storage.local.set({ [CACHE_META_KEY]: { order: trimmed } });
+  } catch (_) {}
 }
 
 async function translateBatchResilient(batch, apiKey, modelName, shouldAbort) {
@@ -421,9 +550,13 @@ ${JSON.stringify(batch)}`;
   }
 
   if (!response.ok) {
-    const errText = await response.text();
+    // Truncate defensively: error bodies can be large and we only keep the
+    // first part for diagnostics anyway.
+    const errText = (await response.text()).slice(0, 2000);
     const retryAfterHeader = response.headers.get("retry-after");
-    let retryAfterMs = retryAfterHeader ? Number(retryAfterHeader) * 1000 : 0;
+    let retryAfterMs = Number.isFinite(Number(retryAfterHeader)) && retryAfterHeader
+      ? Number(retryAfterHeader) * 1000
+      : 0;
 
     try {
       const parsed = JSON.parse(errText);
@@ -481,16 +614,23 @@ function parseStatus(message) {
   return match ? Number(match[1]) : 0;
 }
 
+// 64-bit FNV-1a (two independent 32-bit lanes). A single 32-bit hash collides
+// often enough at tens of thousands of cached cues to serve the wrong
+// translation, so we combine two differently-seeded hashes plus the length.
 function makeCacheKey(text, model) {
   const value = `${model}:en:${text}`;
-  let hash = 2166136261;
+
+  let h1 = 2166136261;
+  let h2 = 5381;
 
   for (let i = 0; i < value.length; i++) {
-    hash ^= value.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
+    const c = value.charCodeAt(i);
+    h1 ^= c;
+    h1 = Math.imul(h1, 16777619);
+    h2 = (Math.imul(h2, 33) + c) | 0;
   }
 
-  return `${(hash >>> 0).toString(16)}_${value.length}`;
+  return `${(h1 >>> 0).toString(16)}_${(h2 >>> 0).toString(16)}_${value.length.toString(36)}`;
 }
 
 function sleep(ms) {

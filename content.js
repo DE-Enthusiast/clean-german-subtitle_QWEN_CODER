@@ -5,13 +5,16 @@ let translations = [];
 let processedVideoId = null;
 let activeRequestId = null;
 let pendingVideoId = null;
+let lastSentCount = 0;
 
 let activePort = null;
 let portPingInterval = null;
 let workerListener = null;
 let watchdogId = null;
+let lastProgressAt = 0;
 
 let syncFrameId = null;
+let syncTimerId = null;
 let activeSubtitleIndex = -1;
 
 function isExtensionContextValid() {
@@ -45,13 +48,23 @@ function decodeHtml(str) {
   }
 }
 
+// The previous regexes used a character class instead of an alternation group
+// (e.g. [|()(musik|music)(]|) matches single characters, never "[Musik]"),
+// so sound-effect cues were never pre-translated and wasted API quota.
+const SOUND_EFFECT_PATTERNS = [
+  { re: /^\s*[[(]\s*(musik|music)\s*[\])]\s*$/i, out: "[Music]" },
+  { re: /^\s*[[(]\s*(applaus|applause|beifall)\s*[\])]\s*$/i, out: "[Applause]" },
+  { re: /^\s*[[(]\s*(lachen|gelächter|laughter)\s*[\])]\s*$/i, out: "[Laughter]" },
+  { re: /^\s*[[(]\s*(stille|silence)\s*[\])]\s*$/i, out: "[Silence]" },
+  { re: /^\s*[[(]\s*(seufzen|sigh)\s*[\])]\s*$/i, out: "[Sigh]" }
+];
+
 function getSoundEffectTranslation(text) {
   const t = String(text || "").trim();
-  if (/^([|()(musik|music)(]|))$/i.test(t)) return "[Music]";
-  if (/^([|()(applaus|applause|beifall)(]|))$/i.test(t)) return "[Applause]";
-  if (/^([|()(lachen|gelächter|laughter)(]|))$/i.test(t)) return "[Laughter]";
-  if (/^([|()(stille|silence)(]|))$/i.test(t)) return "[Silence]";
-  if (/^([|()(seufzen|sigh)(]|))$/i.test(t)) return "[Sigh]";
+  if (!t) return null;
+  for (const { re, out } of SOUND_EFFECT_PATTERNS) {
+    if (re.test(t)) return out;
+  }
   return null;
 }
 
@@ -232,35 +245,75 @@ function hideOverlay() {
 }
 
 function rebuildSubtitles() {
-  currentSubtitles = stitchedSegments.map((segment, idx) => {
+  // stitchedSegments is already time-ordered (stitch sorts, continuations
+  // append newer chunks), so no re-sort is needed. Previously every progress
+  // message rebuilt and re-sorted the entire array — O(n log n) per message,
+  // O(n² log n) across a long video. Now we do one cheap linear pass that
+  // updates only cues whose text actually changed (which is at most the cues
+  // touched by the latest progress message).
+  const len = stitchedSegments.length;
+
+  if (currentSubtitles.length !== len) {
+    currentSubtitles.length = len;
+  }
+
+  for (let i = 0; i < len; i++) {
+    const segment = stitchedSegments[i];
+    const start = segment.startMs / 1000;
+    const end = segment.endMs / 1000;
     const translated =
-      typeof translations[idx] === "string" ? translations[idx].trim() : "";
+      typeof translations[i] === "string" ? translations[i].trim() : "";
+    const text = translated || segment.text;
+    const cue = currentSubtitles[i];
 
-    return {
-      start: segment.startMs / 1000,
-      end: segment.endMs / 1000,
-      text: translated || segment.text
-    };
-  });
-
-  currentSubtitles.sort((a, b) => a.start - b.start);
-  activeSubtitleIndex = -1;
+    if (!cue || cue.text !== text || cue.start !== start || cue.end !== end) {
+      currentSubtitles[i] = { start, end, text };
+      if (i === activeSubtitleIndex) {
+        const textNode = getCachedTextNode();
+        if (textNode) textNode.textContent = text;
+      }
+    }
+  }
 
   startSyncLoop();
 }
 
 function startSyncLoop() {
-  if (!syncFrameId) {
-    syncFrameId = requestAnimationFrame(syncPlaybackLoop);
+  // Subtitle timing granularity of ~100ms is plenty; a perpetual 60fps rAF
+  // loop with per-frame DOM queries burned CPU continuously. rAF also pauses
+  // in background tabs, which a setInterval does not — better behavior here.
+  if (syncFrameId == null && syncTimerId == null) {
+    syncTimerId = setInterval(syncPlaybackTick, 100);
   }
 }
 
 function stopSyncLoop() {
-  if (syncFrameId) {
+  if (syncFrameId != null) {
     cancelAnimationFrame(syncFrameId);
+    syncFrameId = null;
   }
-  syncFrameId = null;
+  if (syncTimerId != null) {
+    clearInterval(syncTimerId);
+    syncTimerId = null;
+  }
   activeSubtitleIndex = -1;
+  overlayTextEl = null;
+  videoEl = null;
+}
+
+let overlayTextEl = null;
+let videoEl = null;
+
+function getCachedTextNode() {
+  if (overlayTextEl && overlayTextEl.isConnected) return overlayTextEl;
+  overlayTextEl = ensureOverlay();
+  return overlayTextEl;
+}
+
+function getCachedVideo() {
+  if (videoEl && videoEl.isConnected) return videoEl;
+  videoEl = document.querySelector("video");
+  return videoEl;
 }
 
 function findSubtitleIndex(time) {
@@ -292,11 +345,10 @@ function findSubtitleIndex(time) {
   return -1;
 }
 
-function syncPlaybackLoop() {
-  syncFrameId = null;
-
+function syncPlaybackTick() {
   if (!isExtensionContextValid()) {
     cleanupJob();
+    stopSyncLoop();
     hideOverlay();
     return;
   }
@@ -307,30 +359,28 @@ function syncPlaybackLoop() {
       return;
     }
 
-    const textNode = ensureOverlay();
-    const video = document.querySelector("video");
-
-    if (!textNode || !video) {
-      syncFrameId = requestAnimationFrame(syncPlaybackLoop);
+    const video = getCachedVideo();
+    if (!video) {
+      hideOverlay();
       return;
     }
 
     const now = Number(video.currentTime || 0) + 0.08;
     const nextIndex = findSubtitleIndex(now);
 
-    if (nextIndex !== activeSubtitleIndex) {
-      activeSubtitleIndex = nextIndex;
+    if (nextIndex === activeSubtitleIndex) return;
 
-      if (nextIndex >= 0) {
-        textNode.textContent = currentSubtitles[nextIndex].text;
-        textNode.style.display = "inline-block";
-      } else {
-        textNode.style.display = "none";
-      }
+    activeSubtitleIndex = nextIndex;
+
+    if (nextIndex >= 0) {
+      const textNode = ensureOverlay();
+      if (!textNode) return;
+      textNode.textContent = currentSubtitles[nextIndex].text;
+      textNode.style.display = "inline-block";
+    } else {
+      hideOverlay();
     }
   } catch (_) {}
-
-  syncFrameId = requestAnimationFrame(syncPlaybackLoop);
 }
 
 function cleanupJob() {
@@ -360,6 +410,7 @@ function cleanupJob() {
 
   activeRequestId = null;
   pendingVideoId = null;
+  lastSentCount = 0;
 }
 
 function setupKeepAlivePort() {
@@ -388,24 +439,103 @@ function setupKeepAlivePort() {
   }
 }
 
-function armWatchdog(ms = 300000) {
+// Liveness tracking for the background job. The old watchdog only checked the
+// keepalive port, which stays alive even if the service worker dies mid-job —
+// subtitles would silently freeze forever. Now we track the timestamp of the
+// last progress message and, when it goes stale, ping the worker directly; if
+// the worker no longer knows about this job (or is dead), we retry from where
+// we left off instead of hanging.
+let jobStartAt = 0;
+
+function requestJobRetry(reason) {
+  const requestId = activeRequestId;
+  if (!requestId || !pendingVideoId) return;
+  if (!isExtensionContextValid()) return;
+
+  const doneCount = translations.filter(Boolean).length;
+  console.warn(
+    `[CleanSubs] ${reason} — restarting translation from cue ${doneCount}/${stitchedSegments.length}.`
+  );
+
+  const newRequestId = `${pendingVideoId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  activeRequestId = newRequestId;
+  lastSentCount = stitchedSegments.length;
+  lastProgressAt = Date.now();
+  jobStartAt = Date.now();
+
+  chrome.runtime.sendMessage(
+    {
+      action: "TRANSLATE_BATCH",
+      requestId: newRequestId,
+      videoId: pendingVideoId,
+      texts: stitchedSegments.map((s) => s.text),
+      startIndex: doneCount,
+      currentPlaybackSec: Number(getCachedVideo()?.currentTime || 0)
+    },
+    (response) => {
+      const err = chrome.runtime.lastError;
+      if (err || !response || response.accepted === false) {
+        console.debug("[CleanSubs] Retry rejected:", err?.message || response?.error);
+      }
+    }
+  );
+}
+
+function armWatchdog(ms = 90000) {
   if (watchdogId) clearTimeout(watchdogId);
 
   watchdogId = setTimeout(() => {
+    watchdogId = null;
     if (!activeRequestId) return;
 
-    console.warn(`[CleanSubs] Health check probe: verifying worker connection...`);
+    const since = Date.now() - lastProgressAt;
 
-    if (activePort) {
-      try {
-        activePort.postMessage({ type: "PING" });
-        armWatchdog(180000);
-        return;
-      } catch (_) {}
+    // Job still delivering progress — nothing to do.
+    if (since < ms * 2) {
+      armWatchdog(ms);
+      return;
     }
 
-    setupKeepAlivePort();
-    armWatchdog(180000);
+    console.warn("[CleanSubs] Health check probe: verifying worker connection...");
+
+    let responded = false;
+    const probeId = activeRequestId;
+
+    const probeListener = (message) => {
+      if (message?.type !== "JOB_ALIVE_RESULT" || message.requestId !== probeId) return;
+      responded = true;
+      try {
+        chrome.runtime.onMessage.removeListener(probeListener);
+      } catch (_) {}
+      if (!message.alive && activeRequestId === probeId) {
+        requestJobRetry("Worker lost our translation job");
+      }
+    };
+
+    try {
+      chrome.runtime.onMessage.addListener(probeListener);
+    } catch (_) {
+      return;
+    }
+
+    try {
+      chrome.runtime.sendMessage(
+        { action: "CHECK_JOB_ALIVE", requestId: probeId },
+        () => void chrome.runtime.lastError
+      );
+    } catch (_) {}
+
+    setTimeout(() => {
+      try {
+        chrome.runtime.onMessage.removeListener(probeListener);
+      } catch (_) {}
+      // No PONG at all means the service worker is dead/unreachable.
+      if (!responded && activeRequestId === probeId) {
+        requestJobRetry("Service worker unresponsive");
+      }
+    }, 8000);
+
+    armWatchdog(ms);
   }, ms);
 }
 
@@ -415,7 +545,7 @@ async function handleEventsPipeline(incomingEvents, videoId, source) {
     return;
   }
 
-  if (!videoId) return;
+  if (!videoId || !Array.isArray(incomingEvents) || !incomingEvents.length) return;
 
   const isContinuation = (videoId === processedVideoId || videoId === pendingVideoId);
 
@@ -425,29 +555,41 @@ async function handleEventsPipeline(incomingEvents, videoId, source) {
     translations = [];
   }
 
-  let eventsToProcess = incomingEvents;
+  // Number of cues already handed to the worker in previous requests. The
+  // background script translates texts[startIndex...] and reports global
+  // indexes, so continuation chunks only send their NEW tail instead of the
+  // whole transcript again (previously O(n^2) message payloads on 3h+ videos).
+  let sentCount = 0;
 
   if (isContinuation && stitchedSegments.length > 0) {
-    const existingStartTimes = new Set(stitchedSegments.map((s) => s.startMs));
-    eventsToProcess = incomingEvents.filter((ev) => !existingStartTimes.has(ev.tStartMs));
+    sentCount = Math.min(lastSentCount, stitchedSegments.length);
 
-    if (!eventsToProcess.length) {
-      return;
-    }
-  }
+    // Dedupe against RAW event start times, not post-stitch segment starts:
+    // stitching shifts/merges boundaries so raw tStartMs values rarely match
+    // stitched startMs exactly — the old comparison silently let overlapping
+    // chunks append duplicate cues. Instead, drop incoming events that overlap
+    // the last existing cue's time range; everything after that boundary is
+    // genuinely new.
+    const lastSeg = stitchedSegments[stitchedSegments.length - 1];
+    const fresh = incomingEvents.filter(
+      (ev) => Number(ev.tStartMs) >= lastSeg.endMs - 250
+    );
 
-  const stitched = stitchGermanSegments(eventsToProcess);
-  if (!stitched.length) return;
+    if (!fresh.length) return; // fully redundant chunk
 
-  if (isContinuation && stitchedSegments.length > 0) {
-    stitchedSegments = stitchedSegments.concat(stitched);
-    for (let i = 0; i < stitched.length; i++) {
-      translations.push(undefined);
-    }
+    const stitchedNew = stitchGermanSegments(fresh);
+    if (!stitchedNew.length) return;
+
+    stitchedSegments = stitchedSegments.concat(stitchedNew);
+    for (let i = 0; i < stitchedNew.length; i++) translations.push(undefined);
+
     console.log(
-      `[CleanSubs] Appended ${stitched.length} new cues for extended video (${stitchedSegments.length} total).`
+      `[CleanSubs] Appended ${stitchedNew.length} new cues for extended video (${stitchedSegments.length} total).`
     );
   } else {
+    const stitched = stitchGermanSegments(incomingEvents);
+    if (!stitched.length) return;
+
     stitchedSegments = stitched;
     translations = new Array(stitched.length);
   }
@@ -460,10 +602,18 @@ async function handleEventsPipeline(incomingEvents, videoId, source) {
     }
   }
 
-  const rawTexts = stitchedSegments.map((s) => s.text);
+  const newTexts = stitchedSegments.slice(sentCount).map((s) => s.text);
+  if (!newTexts.length) {
+    rebuildSubtitles();
+    return;
+  }
+
   const requestId = `${videoId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   activeRequestId = requestId;
   pendingVideoId = videoId;
+  lastSentCount = stitchedSegments.length;
+  lastProgressAt = Date.now();
+  jobStartAt = Date.now();
 
   rebuildSubtitles();
 
@@ -483,11 +633,17 @@ async function handleEventsPipeline(incomingEvents, videoId, source) {
           }
         }
 
+        lastProgressAt = Date.now();
         rebuildSubtitles();
-        armWatchdog(300000);
+        armWatchdog(90000);
 
         if (message.complete) {
           processedVideoId = pendingVideoId;
+          if (watchdogId) {
+            clearTimeout(watchdogId);
+            watchdogId = null;
+          }
+          teardownWorkerChannel();
           console.log(
             `[CleanSubs] Translation complete: ${translations.filter(Boolean).length}/${stitchedSegments.length} cues ready.`
           );
@@ -497,8 +653,13 @@ async function handleEventsPipeline(incomingEvents, videoId, source) {
 
       if (message.type === "TRANSLATION_ERROR") {
         console.warn("[CleanSubs] Translation error:", message.error || "Gemini error");
-        processedVideoId = pendingVideoId;
-        cleanupJob();
+        // Keep German fallback visible and tear down the channel WITHOUT
+        // marking the video processed — a later caption chunk can still retry.
+        if (watchdogId) {
+          clearTimeout(watchdogId);
+          watchdogId = null;
+        }
+        teardownWorkerChannel();
       }
     };
 
@@ -512,10 +673,9 @@ async function handleEventsPipeline(incomingEvents, videoId, source) {
   }
 
   setupKeepAlivePort();
-  armWatchdog(300000);
+  armWatchdog(90000);
 
-  const videoElem = document.querySelector("video");
-  const currentPlaybackSec = Number(videoElem?.currentTime || 0);
+  const currentPlaybackSec = Number(getCachedVideo()?.currentTime || 0);
 
   try {
     chrome.runtime.sendMessage(
@@ -523,7 +683,8 @@ async function handleEventsPipeline(incomingEvents, videoId, source) {
         action: "TRANSLATE_BATCH",
         requestId,
         videoId,
-        texts: rawTexts,
+        texts: newTexts,
+        startIndex: sentCount,
         currentPlaybackSec
       },
       (response) => {
@@ -542,7 +703,8 @@ async function handleEventsPipeline(incomingEvents, videoId, source) {
           return;
         }
 
-        armWatchdog(300000);
+        lastProgressAt = Date.now();
+        armWatchdog(90000);
       }
     );
   } catch (err) {
@@ -551,12 +713,29 @@ async function handleEventsPipeline(incomingEvents, videoId, source) {
   }
 }
 
+// Release the port + ping timer once a job finishes or fails, but keep the
+// message listener attached for future jobs in the same page session.
+function teardownWorkerChannel() {
+  if (portPingInterval) {
+    clearInterval(portPingInterval);
+    portPingInterval = null;
+  }
+  if (activePort) {
+    try {
+      activePort.disconnect();
+    } catch (_) {}
+    activePort = null;
+  }
+  activeRequestId = null;
+}
+
 document.addEventListener("yt-navigate-start", () => {
   cleanupJob();
   currentSubtitles = [];
   stitchedSegments = [];
   translations = [];
   processedVideoId = null;
+  lastSentCount = 0;
 
   stopSyncLoop();
   hideOverlay();
