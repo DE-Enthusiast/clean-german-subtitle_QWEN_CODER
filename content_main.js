@@ -22,10 +22,10 @@
 
   function getVideoId() {
     try {
-      const matchShorts = window.location.pathname.match(//shorts/([a-zA-Z0-9_-]+)/);
+      const matchShorts = window.location.pathname.match(/\/shorts\/([a-zA-Z0-9_-]+)/);
       if (matchShorts && matchShorts[1]) return matchShorts[1];
 
-      const matchEmbed = window.location.pathname.match(//embed/([a-zA-Z0-9_-]+)/);
+      const matchEmbed = window.location.pathname.match(/\/embed\/([a-zA-Z0-9_-]+)/);
       if (matchEmbed && matchEmbed[1]) return matchEmbed[1];
 
       return new URLSearchParams(window.location.search).get("v") || "";

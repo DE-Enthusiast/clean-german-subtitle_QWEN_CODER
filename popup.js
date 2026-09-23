@@ -20,6 +20,16 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   if (data.selectedModel) {
+    // Users may have saved a model that has since been deprecated/renamed
+    // (e.g. the old "gemini-3.1-flash-lite" option). If it isn't in the
+    // current list, add it as a "(legacy)" entry instead of silently
+    // discarding their choice — they can switch to a supported model.
+    if (![...modelSelect.options].some((o) => o.value === data.selectedModel)) {
+      const opt = document.createElement("option");
+      opt.value = data.selectedModel;
+      opt.textContent = `${data.selectedModel} (legacy — may be unavailable)`;
+      modelSelect.appendChild(opt);
+    }
     modelSelect.value = data.selectedModel;
   }
 
@@ -83,29 +93,37 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     showMessage("Testing API connection...", "#0284c7", 0);
 
+    // Route the test through the background service worker, which uses the
+    // same resilient path as real translation jobs: transient 5xx errors are
+    // retried with backoff, and if the selected model has been retired
+    // (404 "no longer available"), we automatically fall back to a working
+    // model instead of failing with a misleading "Test failed" message.
     try {
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      const res = await chrome.runtime.sendMessage({
+        action: "TEST_CONNECTION",
+        apiKey: key,
         model
-      )}:generateContent?key=${encodeURIComponent(key)}`;
-
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: "Translate German 'Guten Tag' to English JSON: ['Hello']" }] }],
-          generationConfig: { responseMimeType: "application/json" }
-        })
       });
 
-      if (res.ok) {
-        showMessage("Connection verified! Model active.", "#16a34a");
+      if (res?.ok) {
+        if (res.modelUsed && res.modelUsed !== model) {
+          showMessage(
+            `Connection verified! "${model}" is unavailable, so "${res.modelUsed}" was used — update the model dropdown and save.`,
+            "#d97706",
+            10000
+          );
+        } else {
+          showMessage("Connection verified! Model active.", "#16a34a");
+        }
       } else {
-        const errorText = await res.text();
-        showMessage(`Error (${res.status}): Invalid key or quota.`, "#dc2626");
-        console.error("Test failed:", errorText);
+        showMessage(
+          `Test failed: ${res?.message || "Unknown error."}${res?.details ? ` (${res.details.slice(0, 160)})` : ""}`,
+          "#dc2626",
+          10000
+        );
       }
     } catch (err) {
-      showMessage("Network test failed.", "#dc2626");
+      showMessage("Could not reach the extension background worker: " + (err?.message || err), "#dc2626", 8000);
     }
   });
 

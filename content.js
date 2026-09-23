@@ -696,9 +696,16 @@ async function handleEventsPipeline(incomingEvents, videoId, source) {
 
         if (!response || response.accepted === false) {
           console.warn("[CleanSubs] Translation job rejected:", response?.error);
+          // Do NOT set processedVideoId here: that permanently disables
+          // retries for this video (e.g. a transient "worker restarting"
+          // rejection would freeze subtitles at German until reload).
+          // cleanupJob() resets lastSentCount, so the next caption event or
+          // watchdog tick can start a fresh request.
           if (activeRequestId === requestId) {
-            processedVideoId = videoId;
+            stitchedSegments = [];
+            translations = [];
             cleanupJob();
+            rebuildSubtitles();
           }
           return;
         }

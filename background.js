@@ -1,6 +1,10 @@
 const BATCH_SIZE = 20;
 const MAX_BATCH_CHARS = 4500;
-const DEFAULT_MODEL = "gemini-3.1-flash-lite";
+const DEFAULT_MODEL = "gemini-2.5-flash-lite";
+// Transient server-side failures worth retrying with backoff. 503 in
+// particular is returned by Gemini when a model is overloaded or being
+// deprecated — it does NOT mean the API key is invalid.
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 const MODEL_PATTERN = /^[a-zA-Z0-9._\-]{1,80}$/;
 const CACHE_PREFIX = "cleanSubsCache:";
 const CACHE_META_KEY = "cleanSubsCacheMeta";
@@ -65,7 +69,56 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   latestRequestIdByTab.delete(tabId);
 });
 
+// Minimal fetch wrapper used by the popup's "Test" button. The popup cannot
+// call translateWithGemini directly, and previously it made its own API call
+// with a hardcoded model — so when that model was retired (404), users saw
+// "Test failed" even though their key was fine and actual translation worked.
+// Routing the test through the same resilient path means: if the saved/tested
+// model is unavailable, we auto-fall back to a working one and report which
+// model actually succeeded.
+async function runConnectionTest(apiKey, modelName) {
+  const probe = ["Guten Tag, wie geht es dir?"];
+  try {
+    await translateWithRetry(probe, apiKey, modelName, null);
+    return { ok: true, modelUsed: activeModelOverride || modelName };
+  } catch (error) {
+    return { ok: false, message: describeError(error), details: String(error?.message || error).slice(0, 300) };
+  }
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request?.action === "TEST_CONNECTION") {
+    (async () => {
+      let apiKey = String(request.apiKey || "").trim();
+      let modelName = String(request.model || "").trim();
+
+      if (!apiKey || !MODEL_PATTERN.test(modelName)) {
+        // Fall back to whatever is saved in storage.
+        const stored = await chrome.storage.local.get(["geminiApiKey", "selectedModel"]);
+        apiKey = apiKey || String(stored.geminiApiKey || "").trim();
+        if (!MODEL_PATTERN.test(modelName)) {
+          modelName = String(stored.selectedModel || DEFAULT_MODEL).trim();
+          if (!MODEL_PATTERN.test(modelName)) modelName = DEFAULT_MODEL;
+        }
+      }
+
+      if (!apiKey) {
+        sendResponse({ ok: false, message: "No API key provided. Enter your Gemini API key first." });
+        return;
+      }
+
+      // Reset any previous auto-switch so each test reflects current state.
+      activeModelOverride = null;
+      const result = await runConnectionTest(apiKey, modelName);
+      sendResponse(result);
+    })().catch((error) => {
+      try {
+        sendResponse({ ok: false, message: "Test failed unexpectedly.", details: String(error?.message || error) });
+      } catch (_) {}
+    });
+    return true; // async sendResponse
+  }
+
   if (request?.action === "CHECK_JOB_ALIVE") {
     const requestId = String(request.requestId || "");
     const job = jobs.get(requestId);
@@ -131,7 +184,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       if (!isStaleJob(tabId, requestId)) {
         await sendProgress(tabId, requestId, {
           type: "TRANSLATION_ERROR",
-          error: error?.message || String(error)
+          error: describeError(error),
+          details: error?.message || String(error)
         });
       }
     })
@@ -152,6 +206,36 @@ function isStaleJob(tabId, requestId) {
     return true;
   }
   return false;
+}
+
+// Turn a raw Gemini error into a short, actionable user-facing message.
+// Previously the full API error body (including huge JSON blobs) leaked into
+// logs/UI and every failure looked like "Gemini API Error (503)", which users
+// misread as an invalid key — 503 actually means Google's servers/model are
+// temporarily unavailable.
+function describeError(error) {
+  const status = error?.status || parseStatus(error?.message);
+  const lower = String(error?.message || "").toLowerCase();
+
+  if (status === 400 && /not found|unsupported|model/i.test(lower)) {
+    return "The selected model isn't available on your account. Pick a different model in the extension popup.";
+  }
+  if (status === 400 && /api key not valid|invalid api key|api_key_invalid/i.test(lower)) {
+    return "Your Gemini API key was rejected. Double-check it in the extension popup.";
+  }
+  if (status === 403) {
+    return "Access denied by Gemini. Make sure Generative Language API is enabled for this key.";
+  }
+  if (status === 429) {
+    return "Gemini rate limit or free-tier quota reached after retries. Try again in a few minutes.";
+  }
+  if (status >= 500) {
+    return `Gemini service temporarily unavailable (HTTP ${status}). Your key is fine — please retry.`;
+  }
+  if (/timed out/i.test(lower)) {
+    return "Gemini request timed out after retries. Check your connection and try again.";
+  }
+  return "Translation failed after retries. See the browser console for details.";
 }
 
 async function processRequest({ requestId, videoId, texts, startIndex = 0, newTexts, tabId, currentPlaybackSec }) {
@@ -466,15 +550,52 @@ async function translateBatchResilient(batch, apiKey, modelName, shouldAbort) {
   }
 }
 
+// If the user's selected model is retired/unavailable on their account
+// (404 NOT_FOUND), Google suggests a replacement in the error message.
+// Rather than failing the whole job, we auto-switch to a working model:
+// first the one Google recommends, then any other known-good default.
+const FALLBACK_MODELS = [
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-2.5-pro"
+];
+
+let activeModelOverride = null;
+
+function suggestedModelFromError(text) {
+  const match = String(text || "").match(/models\/([a-z0-9._-]+)/i);
+  return match ? match[1] : "";
+}
+
+function buildModelCandidates(requestedModel, errorText) {
+  const suggested = suggestedModelFromError(errorText);
+  const seen = new Set();
+  const candidates = [];
+
+  for (const model of [suggested, requestedModel, ...FALLBACK_MODELS]) {
+    if (model && !seen.has(model)) {
+      seen.add(model);
+      candidates.push(model);
+    }
+  }
+  return candidates;
+}
+
 async function translateWithRetry(batch, apiKey, modelName, shouldAbort) {
   let lastError = null;
+  // Honor an auto-switched model across batches so we don't re-discover the
+  // same 404 on every chunk of the job.
+  let effectiveModel = activeModelOverride || modelName;
+  const triedModels = new Set([effectiveModel]);
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     if (shouldAbort?.()) throw new Error("Translation canceled.");
 
     try {
       await waitForRateSlot();
-      return await translateWithGemini(batch, apiKey, modelName);
+      const result = await translateWithGemini(batch, apiKey, effectiveModel);
+      return result;
     } catch (error) {
       lastError = error;
       if (shouldAbort?.()) throw error;
@@ -482,11 +603,44 @@ async function translateWithRetry(batch, apiKey, modelName, shouldAbort) {
       const status = error?.status || parseStatus(error?.message);
       const retryableShape = Boolean(error?.retryableShape);
 
-      if (status !== 429 && !retryableShape) throw error;
+      // Model not found / not available: swap models and retry immediately
+      // (no backoff — this is deterministic, not load-related). Google's 404
+      // body usually names a replacement model; otherwise try known-good ones.
+      if (status === 404) {
+        const candidates = buildModelCandidates(effectiveModel, error?.message);
+        let recovered = false;
 
-      const waitMs = retryableShape
+        for (const candidate of candidates) {
+          if (candidate === effectiveModel || triedModels.has(candidate)) continue;
+          console.warn(
+            `[CleanSubs] Model "${effectiveModel}" is unavailable (404). Falling back to "${candidate}".`
+          );
+          effectiveModel = candidate;
+          activeModelOverride = candidate;
+          triedModels.add(candidate);
+          recovered = true;
+          break;
+        }
+
+        if (recovered) {
+          attempt--; // model switch shouldn't consume a retry slot
+          continue;
+        }
+
+        throw new Error(
+          `Model "${effectiveModel}" was not found and no fallback model worked. Open the extension popup and pick a different model.`
+        );
+      }
+
+      if (!RETRYABLE_STATUSES.has(status) && !retryableShape) throw error;
+
+      // Respect RetryInfo for 429s, but also back off transient 5xx errors
+      // (500/502/503/504) — previously these were thrown immediately and the
+      // whole job failed with a raw "Gemini API Error (503)" even though the
+      // condition is usually gone after a few seconds.
+      const waitMs = retryableShape && !RETRYABLE_STATUSES.has(status)
         ? 1200 * (attempt + 1)
-        : Math.min(60000, Math.max(5000, error?.retryAfterMs || 30000));
+        : Math.min(60000, Math.max(2000, error?.retryAfterMs || 5000 * Math.pow(2, attempt)));
 
       console.warn(
         `[CleanSubs] Gemini retry in ${Math.round(waitMs / 1000)}s (attempt ${attempt + 1}/${MAX_RETRIES}).`
