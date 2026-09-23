@@ -93,60 +93,37 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     showMessage("Testing API connection...", "#0284c7", 0);
 
+    // Route the test through the background service worker, which uses the
+    // same resilient path as real translation jobs: transient 5xx errors are
+    // retried with backoff, and if the selected model has been retired
+    // (404 "no longer available"), we automatically fall back to a working
+    // model instead of failing with a misleading "Test failed" message.
     try {
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      const res = await chrome.runtime.sendMessage({
+        action: "TEST_CONNECTION",
+        apiKey: key,
         model
-      )}:generateContent?key=${encodeURIComponent(key)}`;
-
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: "Translate German 'Guten Tag' to English JSON: ['Hello']" }] }],
-          generationConfig: { responseMimeType: "application/json" }
-        })
       });
 
-      if (res.ok) {
-        showMessage("Connection verified! Model active.", "#16a34a");
-      } else {
-        // The old code claimed "Invalid key or quota" for EVERY failure,
-        // which was misleading — a 503 usually means Google's servers are
-        // overloaded or the selected model is unavailable, not that the key
-        // is bad. Surface the real API error message instead.
-        const errorText = await res.text().catch(() => "");
-        let detail = "";
-        try {
-          const parsed = JSON.parse(errorText);
-          detail = String(parsed?.error?.message || "").trim();
-        } catch (_) {}
-        if (!detail) {
-          detail = errorText.replace(/\s+/g, " ").trim().slice(0, 200);
-        }
-
-        let hint;
-        if (res.status === 404 || /no longer available|not found|unsupported/i.test(detail)) {
-          hint = "This model is unavailable for your account — pick another one in the dropdown.";
-        } else if (res.status === 403 || /api key not valid|invalid api key|permission denied/i.test(detail)) {
-          hint = "Key rejected — check it is enabled for Generative Language API.";
-        } else if (res.status === 429) {
-          hint = "Rate limit / free-tier quota reached. Wait and retry.";
-        } else if (res.status >= 500) {
-          hint = "Google server issue — your key is fine. Try again shortly.";
+      if (res?.ok) {
+        if (res.modelUsed && res.modelUsed !== model) {
+          showMessage(
+            `Connection verified! "${model}" is unavailable, so "${res.modelUsed}" was used — update the model dropdown and save.`,
+            "#d97706",
+            10000
+          );
         } else {
-          hint = "Request failed.";
+          showMessage("Connection verified! Model active.", "#16a34a");
         }
-
-        // Show the real API message too — generic hints alone caused confusion
-        // (e.g. a 503 "high demand" error looking like a bad key).
+      } else {
         showMessage(
-          `Error (${res.status}): ${hint}${detail ? ` — ${detail.slice(0, 160)}` : ""}`,
+          `Test failed: ${res?.message || "Unknown error."}${res?.details ? ` (${res.details.slice(0, 160)})` : ""}`,
           "#dc2626",
           10000
         );
       }
     } catch (err) {
-      showMessage("Network test failed: " + (err?.message || err), "#dc2626", 8000);
+      showMessage("Could not reach the extension background worker: " + (err?.message || err), "#dc2626", 8000);
     }
   });
 

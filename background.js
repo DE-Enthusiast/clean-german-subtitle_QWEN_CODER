@@ -69,7 +69,56 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   latestRequestIdByTab.delete(tabId);
 });
 
+// Minimal fetch wrapper used by the popup's "Test" button. The popup cannot
+// call translateWithGemini directly, and previously it made its own API call
+// with a hardcoded model — so when that model was retired (404), users saw
+// "Test failed" even though their key was fine and actual translation worked.
+// Routing the test through the same resilient path means: if the saved/tested
+// model is unavailable, we auto-fall back to a working one and report which
+// model actually succeeded.
+async function runConnectionTest(apiKey, modelName) {
+  const probe = ["Guten Tag, wie geht es dir?"];
+  try {
+    await translateWithRetry(probe, apiKey, modelName, null);
+    return { ok: true, modelUsed: activeModelOverride || modelName };
+  } catch (error) {
+    return { ok: false, message: describeError(error), details: String(error?.message || error).slice(0, 300) };
+  }
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request?.action === "TEST_CONNECTION") {
+    (async () => {
+      let apiKey = String(request.apiKey || "").trim();
+      let modelName = String(request.model || "").trim();
+
+      if (!apiKey || !MODEL_PATTERN.test(modelName)) {
+        // Fall back to whatever is saved in storage.
+        const stored = await chrome.storage.local.get(["geminiApiKey", "selectedModel"]);
+        apiKey = apiKey || String(stored.geminiApiKey || "").trim();
+        if (!MODEL_PATTERN.test(modelName)) {
+          modelName = String(stored.selectedModel || DEFAULT_MODEL).trim();
+          if (!MODEL_PATTERN.test(modelName)) modelName = DEFAULT_MODEL;
+        }
+      }
+
+      if (!apiKey) {
+        sendResponse({ ok: false, message: "No API key provided. Enter your Gemini API key first." });
+        return;
+      }
+
+      // Reset any previous auto-switch so each test reflects current state.
+      activeModelOverride = null;
+      const result = await runConnectionTest(apiKey, modelName);
+      sendResponse(result);
+    })().catch((error) => {
+      try {
+        sendResponse({ ok: false, message: "Test failed unexpectedly.", details: String(error?.message || error) });
+      } catch (_) {}
+    });
+    return true; // async sendResponse
+  }
+
   if (request?.action === "CHECK_JOB_ALIVE") {
     const requestId = String(request.requestId || "");
     const job = jobs.get(requestId);
